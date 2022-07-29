@@ -28,6 +28,32 @@ def tf_hard_swish(x):
     return x * tf.nn.relu6(x + np.float32(3)) * np.float32(1. / 6.)
 
 
+def _fixed_padding(inputs, kernel_size, rate=1):
+    """Pads the input along the spatial dimensions independently of input size.
+
+    Pads the input such that if it was used in a convolution with 'VALID' padding,
+    the output would have the same dimensions as if the unpadded input was used
+    in a convolution with 'SAME' padding.
+
+    Args:
+      inputs: A tensor of size [batch, height_in, width_in, channels].
+      kernel_size: The kernel to be used in the conv2d or max_pool2d operation.
+      rate: An integer, rate for atrous convolution.
+
+    Returns:
+      output: A tensor of size [batch, height_out, width_out, channels] with the
+        input, either intact (if kernel_size == 1) or padded (if kernel_size > 1).
+    """
+    kernel_size_effective = [kernel_size[0] + (kernel_size[0] - 1) * (rate - 1),
+                             kernel_size[0] + (kernel_size[0] - 1) * (rate - 1)]
+    pad_total = [kernel_size_effective[0] - 1, kernel_size_effective[1] - 1]
+    pad_beg = [pad_total[0] // 2, pad_total[1] // 2]
+    pad_end = [pad_total[0] - pad_beg[0], pad_total[1] - pad_beg[1]]
+    padded_inputs = tf.pad(inputs, [[0, 0], [pad_beg[0], pad_end[0]],
+                                    [pad_beg[1], pad_end[1]], [0, 0]])
+    return padded_inputs
+
+
 def _depth(v, divisor=8, min_value=None):
     if min_value is None:
         min_value = divisor
@@ -61,7 +87,6 @@ def _se_block(inputs, filters, se_ratio, prefix):
 def _tf_se_block(inputs, filters, se_ratio, prefix):
     x = tf.reduce_mean(inputs, axis=[1, 2], name=prefix + 'squeeze_excite/AvgPool')
     x = tf.reshape(x, (-1, 1, 1, filters))
-    print(_depth(filters * se_ratio))
     x = tf.layers.conv2d(x,
                          _depth(filters * se_ratio),
                          kernel_size=1,
@@ -102,6 +127,64 @@ def _inverted_res_block(x, expansion, filters, kernel_size, stride,
     if stride == 2:
         x = layers.ZeroPadding2D(padding=correct_pad(backend, x, kernel_size),
                                  name=prefix + 'depthwise/pad')(x)
+    x = layers.DepthwiseConv2D(kernel_size,
+                               strides=stride,
+                               padding='same' if stride == 1 else 'valid',
+                               use_bias=False,
+                               name=prefix + 'depthwise')(x)
+    x = layers.BatchNormalization(axis=channel_axis,
+                                  epsilon=1e-3,
+                                  momentum=0.999,
+                                  name=prefix + 'depthwise/BatchNorm')(x)
+    x = layers.Activation(activation)(x)
+
+    if se_ratio:
+        x = _se_block(x, _depth(infilters * expansion), se_ratio, prefix)
+
+    x = layers.Conv2D(filters,
+                      kernel_size=1,
+                      padding='same',
+                      use_bias=False,
+                      name=prefix + 'project')(x)
+    x = layers.BatchNormalization(axis=channel_axis,
+                                  epsilon=1e-3,
+                                  momentum=0.999,
+                                  name=prefix + 'project/BatchNorm')(x)
+
+    if stride == 1 and infilters == filters:
+        x = layers.Add(name=prefix + 'Add')([shortcut, x])
+    return x
+
+
+def _tf_inverted_res_block(x, expansion, filters, kernel_size, stride,
+                           se_ratio, activation, block_id):
+    channel_axis = -1
+    shortcut = x
+    prefix = 'expanded_conv/'
+    infilters = x.shape[channel_axis]
+    if block_id:
+        # Expand
+        prefix = 'expanded_conv_{}/'.format(block_id)
+        x = tf.layers.conv2d(
+            x,
+            _depth(infilters * expansion),
+            kernel_size=1,
+            padding='same',
+            use_bias=False,
+            name=prefix + 'expand'
+        )
+
+        x = tf.layers.batch_normalization(x,
+                                          axis=channel_axis,
+                                          epsilon=1e-3,
+                                          momentum=0.999,
+                                          name=prefix + 'expand/BatchNorm')
+        x = activation(x)
+
+    if stride == 2:
+        # x = layers.ZeroPadding2D(padding=correct_pad(backend, x, kernel_size),
+        #                          name=prefix + 'depthwise/pad')(x)
+        x = _fixed_padding(x, kernel_size)
     x = layers.DepthwiseConv2D(kernel_size,
                                strides=stride,
                                padding='same' if stride == 1 else 'valid',
