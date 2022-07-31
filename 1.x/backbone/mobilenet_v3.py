@@ -248,11 +248,18 @@ def mobilenet_v3_large(inputs,
 
 
 if __name__ == '__main__':
-    a = tf.placeholder(dtype=tf.float32, shape=(None, 224, 224, 3))
+    a = tf.placeholder(dtype=tf.float32, shape=(None, 224, 224, 3), name="input")
     b = mobilenet_v3_large(a)
     init = tf.global_variables_initializer()
 
     with tf.Session() as sess:
         sess.run(init)
         c = sess.run(b, feed_dict={a: np.zeros((8, 224, 224, 3), dtype=float)})
-    print(c.shape)
+        print(c.shape)
+
+        converted_graph_def = tf.graph_util.convert_variables_to_constants(sess,
+                                                                           input_graph_def=sess.graph.as_graph_def(),
+                                                                           output_node_names=['backbone_output'])
+
+        with tf.gfile.GFile("model.pb", "wb") as f:
+            f.write(converted_graph_def.SerializeToString())
